@@ -692,6 +692,70 @@ function showAlert(title, message) {
 function closeAlert() { const m = $("modal-mount"); if (m) m.innerHTML = ""; }
 function showErrorPopup(msg) { showAlert(msg); }
 
+// GPS GATE - block silent submission without a location fix.
+// Shown at submit time whenever captureGPS() did NOT return CAPTURED.
+// Reuses existing modal styles. Resolves to "retry" | "anyway".
+function showGpsGate(status){
+  var reasonMap = {
+    "TIMEOUT":       "We could not lock your location in time. This usually happens indoors or on a weak signal.",
+    "UNAVAILABLE":   "Location is currently unavailable. Your phone's location (GPS) may be switched OFF.",
+    "DENIED":        "Location access was blocked for this app/site, so we cannot record where you are.",
+    "FAILED":        "We could not get your location.",
+    "NOT_SUPPORTED": "This device/browser cannot provide a location.",
+    "UNKNOWN":       "We could not confirm your location."
+  };
+  var fixHint = (status === "DENIED")
+    ? "To fix: allow Location for this app, then tap RETRY."
+    : (status === "UNAVAILABLE")
+      ? "To fix: turn ON your phone's Location / GPS, then tap RETRY."
+      : "Move near an entrance or window for better signal, then tap RETRY.";
+  var reason = reasonMap[status] || reasonMap.UNKNOWN;
+  return new Promise(function(resolve){
+    var m = $("modal-mount");
+    if (!m) { resolve(confirm("LOCATION NOT CAPTURED. SUBMIT ANYWAY?") ? "anyway" : "retry"); return; }
+    m.innerHTML =
+      '<div class="modal-bg" id="__gps_bg__"><div class="modal">' +
+        '<div class="modal-title">\uD83D\uDCCD LOCATION NOT CAPTURED</div>' +
+        '<div class="modal-msg">' + reason + '<br><br><b>' + fixHint + '</b></div>' +
+        '<div class="modal-btns">' +
+          '<button class="btn btn-secondary" id="__gps_anyway__">SUBMIT ANYWAY</button>' +
+          '<button class="btn btn-primary" id="__gps_retry__">RETRY GPS</button>' +
+        '</div>' +
+      '</div></div>';
+    var done = function(v){ m.innerHTML = ""; resolve(v); };
+    var r = $("__gps_retry__");  if (r) r.addEventListener("click", function(){ done("retry"); });
+    var a = $("__gps_anyway__"); if (a) a.addEventListener("click", function(){ done("anyway"); });
+  });
+}
+
+// PRE-FLIGHT LOCATION CHECK - run once when an audit starts.
+// Warns the rep early if Location is OFF/blocked. Non-blocking.
+var __locPreflightDone = false;
+function preflightLocationCheck(){
+  if (__locPreflightDone) return;
+  __locPreflightDone = true;
+  if (!navigator.geolocation) return;
+  var warnOff = function(){
+    showAlert("\uD83D\uDCCD TURN ON LOCATION",
+      "Your phone's Location (GPS) looks switched OFF or blocked.<br><br>" +
+      "Please turn it ON now so your store visit can be verified. " +
+      "You'll be asked to capture GPS when you submit.");
+  };
+  if (navigator.permissions && navigator.permissions.query) {
+    navigator.permissions.query({ name: "geolocation" })
+      .then(function(res){ if (res && res.state === "denied") warnOff(); })
+      .catch(function(){});
+    return;
+  }
+  try {
+    navigator.geolocation.getCurrentPosition(
+      function(){},
+      function(err){ if (err && (err.code === 1 || err.code === 2)) warnOff(); },
+      { enableHighAccuracy: false, timeout: 4000, maximumAge: 600000 }
+    );
+  } catch (e) {}
+}
+
 // ═══════════════════════════════════════════════════════════════
 // v3 update: PHOTO LIGHTBOX (tap thumbnail to review full-screen)
 // ═══════════════════════════════════════════════════════════════
@@ -932,8 +996,8 @@ function renderHome() {
 
   const accSku = CHAIN_TO_ACCOUNT[acc] || acc;
   const skusForAccount = getSkus(accSku);
-  // Selfie required when PRESENT and chain mandates photos (everyone except DMART)
-  const selfieReady = !isPhotoMandatory() || !!S.selfie;
+  // Selfie required when PRESENT for ALL chains (incl. DMART).
+  const selfieReady = !!S.selfie;
   const canStartAudit = attReady && att === "PRESENT" && skusForAccount.length > 0 && !alreadyDone && selfieReady;
   const canSubmitAdhoc = attReady && att === "ADHOC TASK ASSIGNED" && S.adhocConfirmed;
   const canSubmitClosed = attReady && att === "STORE CLOSED" && S.closedConfirmed;
@@ -1271,6 +1335,7 @@ function bind() {
     S.view = "audit";
     render();
     scrollAuditToTop();
+    preflightLocationCheck();
   });
   on("btn-submit-att","click", () => submitAttendance());
   on("btn-hist","click", () => { S.view = "history"; render(); });
@@ -1464,7 +1529,7 @@ function bind() {
     btn.addEventListener('click', () => openCamera({ mode:"talker", skuId: btn.getAttribute('data-cam-talker') }));
   });
   document.querySelectorAll('[data-remove-selfie]').forEach(btn => {
-    btn.addEventListener('click', (e) => { e.stopPropagation(); S.selfie = ""; render(); });
+    btn.addEventListener('click', (e) => { e.stopPropagation(); S.selfie = ""; S.selfieTime = ""; render(); });
   });
   document.querySelectorAll('[data-remove-talker]').forEach(btn => {
     btn.addEventListener('click', (e) => { e.stopPropagation(); delete S.skuPhotos[btn.getAttribute('data-remove-talker')]; render(); });
@@ -1511,6 +1576,7 @@ function resetForNewSubmission() {
   S.shelfPhotos = {};
   S.skuPhotos = {};
   S.selfie = "";
+  S.selfieTime = "";
   S.gps = null;
   clearAttSubState();
   S.view = "home";
@@ -1522,6 +1588,7 @@ function resetForNewSubmission() {
 if(!S.shelfPhotos) S.shelfPhotos = {};
 if(!S.gps) S.gps = null;
 if(!S.selfie) S.selfie = "";          // base64 attendance selfie
+if(!S.selfieTime) S.selfieTime = "";  // HH:mm:ss when selfie was taken (Attendance Time)
 if(!S.skuPhotos) S.skuPhotos = {};   // { pbb_code: base64 } shelf talker per SKU
 if(!S.lightbox) S.lightbox = { open:false, items:[], index:0 };
 if(!S.camera) S.camera = {
@@ -1545,29 +1612,53 @@ function isInAppBrowser(){
   return /WhatsApp|FBAN|FBAV|Instagram|Line\//i.test(ua);
 }
 function captureGPS(timeoutMs){
-  timeoutMs = timeoutMs || 15000;
+  // Two-stage capture so we almost never log a bare TIMEOUT:
+  //   Stage 1 - quick precise GPS/satellite fix (enableHighAccuracy:true). Best outdoors.
+  //   Stage 2 - if stage 1 fails/times out, fall back to a fast network/Wi-Fi fix
+  //             (enableHighAccuracy:false), which still works inside stores where
+  //             satellite GPS rarely locks. For a 500 m geo-fence the coarser fix is fine.
+  // Both successful stages return status:"CAPTURED".
+  const highAccMs = timeoutMs || 8000;
+  const coarseMs  = 30000;
+  const hardCapMs = highAccMs + coarseMs + 3000;
   return new Promise(resolve => {
     if(!navigator.geolocation){
       resolve({lat:null,lng:null,accuracy:null,status:"NOT_SUPPORTED"}); return;
     }
     let done = false;
     const finish = r => { if(done) return; done = true; resolve(r); };
-    setTimeout(()=>finish({lat:null,lng:null,accuracy:null,status:"TIMEOUT"}), timeoutMs + 1500);
+    setTimeout(()=>finish({lat:null,lng:null,accuracy:null,status:"TIMEOUT"}), hardCapMs);
+    const ok = pos => finish({
+      lat: +pos.coords.latitude.toFixed(6),
+      lng: +pos.coords.longitude.toFixed(6),
+      accuracy: Math.round(pos.coords.accuracy || 0),
+      status: "CAPTURED"
+    });
+    const classify = err => {
+      if(err && err.code === 1) return "DENIED";
+      if(err && err.code === 2) return "UNAVAILABLE";
+      if(err && err.code === 3) return "TIMEOUT";
+      return "FAILED";
+    };
+    const coarseStage = prevStatus => {
+      navigator.geolocation.getCurrentPosition(
+        ok,
+        err => {
+          let st = classify(err);
+          if(st === "FAILED" && prevStatus) st = prevStatus;
+          finish({lat:null,lng:null,accuracy:null,status:st});
+        },
+        { enableHighAccuracy: false, timeout: coarseMs, maximumAge: 300000 }
+      );
+    };
     navigator.geolocation.getCurrentPosition(
-      pos => finish({
-        lat: +pos.coords.latitude.toFixed(6),
-        lng: +pos.coords.longitude.toFixed(6),
-        accuracy: Math.round(pos.coords.accuracy || 0),
-        status: "CAPTURED"
-      }),
+      ok,
       err => {
-        let st = "FAILED";
-        if(err && err.code === 1) st = "DENIED";
-        else if(err && err.code === 2) st = "UNAVAILABLE";
-        else if(err && err.code === 3) st = "TIMEOUT";
-        finish({lat:null,lng:null,accuracy:null,status:st});
+        const st = classify(err);
+        if(st === "DENIED"){ finish({lat:null,lng:null,accuracy:null,status:"DENIED"}); return; }
+        coarseStage(st);
       },
-      { enableHighAccuracy: true, timeout: timeoutMs, maximumAge: 30000 }
+      { enableHighAccuracy: true, timeout: highAccMs, maximumAge: 120000 }
     );
   });
 }
@@ -1835,6 +1926,8 @@ function commitCameraPhotos(){
   const mode = S.camera.mode;
   if(mode === "selfie"){
     S.selfie = S.camera.temp[0];
+    // Stamp the moment the attendance selfie was taken (local IST-style HH:mm:ss).
+    S.selfieTime = nowTime();
   } else if(mode === "talker"){
     if(S.camera.skuId){ S.skuPhotos[S.camera.skuId] = S.camera.temp[0]; }
   } else {
@@ -1870,8 +1963,8 @@ function getMissingShelfTalkerSkus(){
   return out;
 }
 function isSelfieMissing(){
+  // Attendance selfie is COMPULSORY FOR ALL chains when marked PRESENT.
   if(S.attendance !== "PRESENT") return false;
-  if(!isPhotoMandatory()) return false;
   return !S.selfie;
 }
 function renderPhotoBlock(cat){
@@ -1919,11 +2012,11 @@ function renderShelfTalkerBlock(skuId){
 // v3: attendance selfie block — shown at top of audit when PRESENT
 function renderSelfieBlock(){
   const has = !!S.selfie;
-  const mandatory = isPhotoMandatory();
-  const cls = "photo-block" + (has ? " done" : (mandatory ? "" : " optional"));
+  const mandatory = true;   // selfie compulsory for ALL chains
+  const cls = "photo-block" + (has ? " done" : "");
   const lbl = has
     ? "✓ ATTENDANCE SELFIE CAPTURED"
-    : (mandatory ? "ATTENDANCE SELFIE REQUIRED" : "ATTENDANCE SELFIE (OPTIONAL)");
+    : "ATTENDANCE SELFIE REQUIRED";
   let html = '<div class="' + cls + '" style="margin:0 14px 12px">';
   html += '<div class="photo-block-lbl">' + lbl + '</div>';
   if(has){
@@ -2055,21 +2148,23 @@ async function doSubmit() {
     showAlert("📷 CATEGORY PHOTO REQUIRED", "A category photo is required for: " + missing.join(", ") + ".");
     return;
   }
-  // Capture GPS at submit (user-initiated → permission prompt shows naturally if needed)
-  showLoadingModal("GETTING LOCATION…");
+  // Capture GPS at submit. If we don't get a CAPTURED fix, gate the submission:
+  // let the rep RETRY (fresh capture) or explicitly SUBMIT ANYWAY. Stops silent
+  // "moved-on-too-early" rows without hard-blocking a genuine no-signal visit.
   let gps;
-  try {
-    gps = await captureGPS(15000);
-  } catch (e) {
-    gps = { lat:null, lng:null, accuracy:null, status:"FAILED" };
-  } finally {
-    hideModal();
-  }
-  S.gps = gps;
-  if (gps.status === "DENIED") {
-    if (!confirm("⚠️ LOCATION ACCESS DENIED.\n\nYOUR SUBMISSION WILL BE FLAGGED. TO FIX:\n• OPEN IN CHROME (NOT WHATSAPP BROWSER)\n• TAP THE LOCK ICON → PERMISSIONS → LOCATION → ALLOW\n\nPROCEED WITHOUT LOCATION?")) {
-      return;
+  while (true) {
+    showLoadingModal("GETTING LOCATION…");
+    try {
+      gps = await captureGPS();
+    } catch (e) {
+      gps = { lat:null, lng:null, accuracy:null, status:"FAILED" };
+    } finally {
+      hideModal();
     }
+    S.gps = gps;
+    if (gps && gps.status === "CAPTURED") break;
+    const choice = await showGpsGate(gps ? gps.status : "UNKNOWN");
+    if (choice === "anyway") break;
   }
   doSubmitInner();
 }
@@ -2168,6 +2263,7 @@ function postToWebhook(rows) {
     rows: rows,
     photos: photos,
     selfie: S.selfie || "",
+    selfieTime: S.selfieTime || "",
     skuPhotos: skuPhotos,
     gps: S.gps || { lat:null, lng:null, accuracy:null, status:"UNKNOWN" },
     formDurationSec: S.formStartAt ? Math.round((Date.now() - new Date(S.formStartAt).getTime())/1000) : "",
@@ -2186,6 +2282,7 @@ function postToWebhook(rows) {
     S.shelfPhotos = {};
     S.skuPhotos = {};
     S.selfie = "";
+    S.selfieTime = "";
     S.gps = null;
   }).catch(err => {
     hideModal();
