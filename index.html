@@ -221,7 +221,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 // ═══════════════════════════════════════════════════════════════
 // WEBHOOK URL — your newly deployed Apps Script
 // ═══════════════════════════════════════════════════════════════
-const WEBHOOK_URL = "https://script.google.com/macros/s/AKfycby4qUT2GCEmwCCkdrnwi0NSs7lKkM9tf22bBSa30h7OCots64GB1rT57WV-AHZ847al/exec";
+const WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxjnPha_O-H7HHorpP6TN_20DYZIKhpo6nC482spP-8Eu-kYYiMPxzHv5efwFfhBjjF/exec";
 
 // ═══════════════════════════════════════════════════════════════
 // EMBEDDED MASTER DATA — EMPLOYEES (part 1)
@@ -445,7 +445,14 @@ function nowStr() {
   return d.toLocaleDateString("en-IN") + " " + d.toLocaleTimeString("en-IN", {hour:"2-digit", minute:"2-digit"});
 }
 function nowTime() {
-  return todayDate().toLocaleTimeString("en-IN", {hour:"2-digit", minute:"2-digit", second:"2-digit"});
+  try {
+    const t = todayDate().toLocaleTimeString("en-IN", {hour:"2-digit", minute:"2-digit", second:"2-digit"});
+    if (t && String(t).trim()) return t;
+  } catch(e) {}
+  // Hard fallback — never return empty, so Attendance Time is always stamped.
+  const d = todayDate();
+  const p = n => String(n).padStart(2,"0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
 }
 function formatDateTimeISO(iso) {
   if (!iso) return "";
@@ -1928,6 +1935,7 @@ function commitCameraPhotos(){
     S.selfie = S.camera.temp[0];
     // Stamp the moment the attendance selfie was taken (local IST-style HH:mm:ss).
     S.selfieTime = nowTime();
+    if(!S.selfieTime){ S.selfieTime = nowTime(); }   // belt-and-braces
   } else if(mode === "talker"){
     if(S.camera.skuId){ S.skuPhotos[S.camera.skuId] = S.camera.temp[0]; }
   } else {
@@ -2263,8 +2271,10 @@ function postToWebhook(rows) {
     rows: rows,
     photos: photos,
     selfie: S.selfie || "",
-    selfieTime: S.selfieTime || "",
+    // Last-resort: a PRESENT submission with a selfie must carry a time.
+    selfieTime: (S.selfie && !S.selfieTime ? nowTime() : (S.selfieTime || "")),
     skuPhotos: skuPhotos,
+    clientBuild: "HTML-v8-attTime-2",
     gps: S.gps || { lat:null, lng:null, accuracy:null, status:"UNKNOWN" },
     formDurationSec: S.formStartAt ? Math.round((Date.now() - new Date(S.formStartAt).getTime())/1000) : "",
     source: "PATANJALI_MODERN_TRADE_SAATHI_V3",
